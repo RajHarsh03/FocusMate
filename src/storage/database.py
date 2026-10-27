@@ -117,6 +117,40 @@ def _to_int(value, default):
         return default
 
 
+def _calculate_summary(conn, session_id):
+    """Calculate the summary numbers of one session from its readings.
+
+    Uses the connection it is given (it does not open or close one), so the
+    caller can run it inside its own transaction. Shared by end_session()
+    and the demo data seeder, so both use exactly the same logic.
+
+    Returns a dictionary with avg_ear, total_blinks, face_missing_sec,
+    looking_away_sec and avg_focus_preview. With no readings, the averages
+    are None and the counts are 0.
+    """
+    # AVG skips NULL values, so readings without a value are ignored.
+    # SUM over zero rows gives NULL, so COALESCE turns it into 0.
+    row = conn.execute(
+        "SELECT "
+        "  AVG(CASE WHEN face_detected = 1 THEN ear END) AS avg_ear, "
+        "  COALESCE(SUM(blinks_in_interval), 0) AS total_blinks, "
+        "  COALESCE(SUM(CASE WHEN face_detected = 0 THEN 1 ELSE 0 END), 0) "
+        "    AS face_missing_sec, "
+        "  COALESCE(SUM(CASE WHEN head_direction NOT IN (?, ?) THEN 1 ELSE 0 END), 0) "
+        "    AS looking_away_sec, "
+        "  AVG(focus_preview) AS avg_focus_preview "
+        "FROM focus_readings WHERE session_id = ?",
+        ("center", "unknown", session_id),
+    ).fetchone()
+    return {
+        "avg_ear": row[0],
+        "total_blinks": row[1],
+        "face_missing_sec": row[2],
+        "looking_away_sec": row[3],
+        "avg_focus_preview": row[4],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public functions (the interface other modules use)
 # ---------------------------------------------------------------------------
@@ -204,3 +238,51 @@ def save_reading(session_id, reading):
     except sqlite3.Error as error:
         print(f"[storage] Warning: reading not saved for session {session_id}: {error}",
               file=sys.stderr)
+
+
+def end_session(session_id):
+    """Close a session and calculate its summary columns from its readings.
+
+    Sets end_time, actual_duration_sec (end time minus start time) and
+    status 'ended', then fills avg_ear, total_blinks, face_missing_sec,
+    looking_away_sec and avg_focus_preview. If there are no readings, the
+    averages stay empty (None) and the counts are 0.
+
+    Does nothing if the session does not exist or has already ended, so a
+    second call (for example a double click on Stop) cannot change the result.
+    """
+    conn = _connect()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT start_time, status FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None or row["status"] == "ended":
+                return
+
+            end_time = _now_iso()
+            started = datetime.fromisoformat(row["start_time"])
+            ended = datetime.fromisoformat(end_time)
+            actual_duration = max(0, int((ended - started).total_seconds()))
+            stats = _calculate_summary(conn, session_id)
+
+            conn.execute(
+                "UPDATE sessions SET end_time = ?, actual_duration_sec = ?, status = ?, "
+                "avg_ear = ?, total_blinks = ?, face_missing_sec = ?, "
+                "looking_away_sec = ?, avg_focus_preview = ? "
+                "WHERE session_id = ?",
+                (
+                    end_time,
+                    actual_duration,
+                    "ended",
+                    stats["avg_ear"],
+                    stats["total_blinks"],
+                    stats["face_missing_sec"],
+                    stats["looking_away_sec"],
+                    stats["avg_focus_preview"],
+                    session_id,
+                ),
+            )
+    finally:
+        conn.close()
