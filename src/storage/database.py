@@ -286,3 +286,102 @@ def end_session(session_id):
             )
     finally:
         conn.close()
+
+
+def get_session_summary(session_id):
+    """Return the Contract C dictionary for one session, or None if not found."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT session_id, user_name, start_time, end_time, planned_duration_sec, "
+            "actual_duration_sec, status, avg_ear, total_blinks, face_missing_sec, "
+            "looking_away_sec, avg_focus_preview "
+            "FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def get_readings(session_id):
+    """Return all readings of one session, oldest first, as a list of dictionaries.
+
+    face_detected comes back as stored: 1 for yes, 0 for no.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT reading_id, session_id, timestamp, elapsed_sec, face_detected, ear, "
+            "blinks_in_interval, head_direction, focus_preview "
+            "FROM focus_readings WHERE session_id = ? ORDER BY reading_id",
+            (session_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def list_sessions(limit=20):
+    """Return up to `limit` sessions as Contract C dictionaries, newest first."""
+    limit = _to_int(limit, 20)
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT session_id, user_name, start_time, end_time, planned_duration_sec, "
+            "actual_duration_sec, status, avg_ear, total_blinks, face_missing_sec, "
+            "looking_away_sec, avg_focus_preview "
+            "FROM sessions ORDER BY start_time DESC, session_id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def delete_session(session_id):
+    """Delete one session together with its readings and break events.
+
+    Mainly for cleaning up test data. Child rows are deleted first so the
+    FOREIGN KEY rules are never broken. Does nothing if the session is missing.
+    """
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute("DELETE FROM focus_readings WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM break_events WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Small demo: python src/storage/database.py
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    init_db()
+    print(f"Database ready at: {os.path.abspath(DB_PATH)}")
+
+    demo_id = start_session("demo", 60)
+    print(f"Started demo session {demo_id}")
+
+    demo_readings = [
+        {"face_detected": True, "ear": 0.29, "blinks_in_interval": 1,
+         "head_direction": "center", "focus_preview": 100.0, "elapsed_sec": 1.0},
+        {"face_detected": True, "ear": 0.27, "blinks_in_interval": 0,
+         "head_direction": "left", "focus_preview": 60.0, "elapsed_sec": 2.0},
+        {"face_detected": False, "ear": None, "blinks_in_interval": 0,
+         "head_direction": "unknown", "focus_preview": 0.0, "elapsed_sec": 3.0},
+    ]
+    for demo_reading in demo_readings:
+        save_reading(demo_id, demo_reading)
+
+    end_session(demo_id)
+    print(f"Saved {len(get_readings(demo_id))} readings. Summary:")
+    for key, value in get_session_summary(demo_id).items():
+        print(f"  {key:<22} {value}")
+
+    delete_session(demo_id)
+    print(f"Demo session {demo_id} deleted, so the real database stays clean.")
