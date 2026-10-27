@@ -1,0 +1,6 @@
+# Tested together with Python 3.11.9 on Windows (27 Oct 2026). Python 3.10 or higher is required.
+opencv-python==5.0.0.93
+mediapipe==1.1.1
+streamlit==1.66.1
+numpy==2.4.6
+matplotlib==3.11.2
