@@ -21,12 +21,18 @@ Rules followed in this file:
     - Only numbers and labels are stored. No webcam images, ever.
 """
 
+import math
 import os
 import sqlite3
+import sys
+from datetime import datetime
 
 # Location of the database file. Every function reads this variable at the
 # moment it runs, so a test can point it at a temporary file first.
 DB_PATH = "data/focusmate.db"
+
+# Head direction labels allowed by Contract A and Contract B.
+VALID_DIRECTIONS = ("center", "left", "right", "up", "down", "unknown")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -83,6 +89,34 @@ def _connect():
     return conn
 
 
+def _now_iso():
+    """Return the current local time as ISO text, to the second."""
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _to_float(value):
+    """Return value as a float, or None if it is missing or not a valid number."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
+
+
+def _to_int(value, default):
+    """Return value as an int, or the given default if it cannot be converted."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Public functions (the interface other modules use)
 # ---------------------------------------------------------------------------
@@ -102,3 +136,71 @@ def init_db():
         conn.commit()
     finally:
         conn.close()
+
+
+def start_session(user_name, planned_duration_sec):
+    """Create a new session row with status 'active' and return its session_id.
+
+    An empty or missing user_name is stored as 'default'.
+    """
+    name = str(user_name).strip() if user_name is not None else ""
+    if not name:
+        name = "default"
+    planned = _to_int(planned_duration_sec, None)
+
+    conn = _connect()
+    try:
+        with conn:  # commits on success, rolls back on error
+            cursor = conn.execute(
+                "INSERT INTO sessions (user_name, start_time, planned_duration_sec, status) "
+                "VALUES (?, ?, ?, ?)",
+                (name, _now_iso(), planned, "active"),
+            )
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def save_reading(session_id, reading):
+    """Store one reading (Contract B dictionary) for a running session.
+
+    The timestamp is added here, so the caller does not send it. Bad or
+    missing values are stored as empty (NULL) instead of crashing, and an
+    unknown head direction is stored as 'unknown'. This runs about once per
+    second inside the live loop, so a database error is reported as a
+    warning and the loop keeps going.
+    """
+    if not isinstance(reading, dict):
+        reading = {}
+
+    face_detected = 1 if reading.get("face_detected") else 0
+    direction = reading.get("head_direction")
+    if direction not in VALID_DIRECTIONS:
+        direction = "unknown"
+
+    values = (
+        session_id,
+        _now_iso(),
+        _to_float(reading.get("elapsed_sec")),
+        face_detected,
+        _to_float(reading.get("ear")),
+        _to_int(reading.get("blinks_in_interval"), 0),
+        direction,
+        _to_float(reading.get("focus_preview")),
+    )
+
+    try:
+        conn = _connect()
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO focus_readings (session_id, timestamp, elapsed_sec, "
+                    "face_detected, ear, blinks_in_interval, head_direction, focus_preview) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    values,
+                )
+        finally:
+            conn.close()
+    except sqlite3.Error as error:
+        print(f"[storage] Warning: reading not saved for session {session_id}: {error}",
+              file=sys.stderr)
