@@ -223,6 +223,26 @@ FocusMate stores everything in a local SQLite database with three main tables:
 | `focus_readings` | Time-stamped Focus Score readings logged during a session |
 | `break_events` | Breaks that were prompted, taken, or skipped |
 
+### Storage extras
+
+Extra storage functions for demos and analytics. The dashboard only calls these functions and never writes SQL.
+
+| Function | File | Input | Returns | Called by |
+|:---|:---|:---|:---|:---|
+| `seed_demo_sessions(count=6)` | `src/storage/seed_demo_data.py` | Number of sessions | List of new `session_id`s | Harsh before a demo (`python src/storage/seed_demo_data.py`), or an optional dashboard button |
+| `clear_demo_data()` | `src/storage/seed_demo_data.py` | None | Number of demo sessions removed | Harsh after a demo, or an optional dashboard button |
+| `make_focus_chart(session_id)` | `src/storage/charts.py` | `session_id` | matplotlib `Figure`, or `None` if the session has no readings | Dashboard (Ayush): summary and past sessions screens, with `st.pyplot(fig)` |
+| `get_overall_stats()` | `src/storage/analytics.py` | None | Dictionary: `total_sessions`, `total_study_sec`, `avg_focus`, `best_session` (session summary or `None`), `total_blinks` | Dashboard (Ayush): analytics area, `st.metric` |
+| `get_daily_summary(days=7)` | `src/storage/analytics.py` | Number of days | List of dictionaries, newest date first: `date`, `sessions`, `total_study_sec`, `avg_focus` | Dashboard (Ayush): analytics area, `st.dataframe` or `st.table` |
+| `export_session_csv(session_id, output_path=None)` | `src/storage/export.py` | `session_id`, optional file path | Path of the CSV file, or `None` if the session does not exist | Dashboard (Ayush): download button on the summary screen |
+
+Notes:
+
+- Check for `None` before calling `st.pyplot`.
+- Analytics count only ended sessions.
+- Demo sessions use the user name `demo`, and `clear_demo_data()` deletes every session with that name. Keep the default user name in the dashboard and do not let users type `demo`.
+- CSV files are saved in `data/exports/` by default. This folder is ignored by git.
+
 ---
 
 ## Project Status and Roadmap
