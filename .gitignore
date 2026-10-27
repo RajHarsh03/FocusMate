@@ -1,1 +1,5 @@
 /Term-Paper-Seminar-Docs
+*.db
+__pycache__/
+.venv/
+data/exports/

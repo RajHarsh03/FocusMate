@@ -135,46 +135,73 @@ FocusMate/
 
 ### Prerequisites
 
-- Python 3.10 or newer
+- Python 3.10 or newer (tested with Python 3.11.9). Check with `python --version`
 - A working webcam
 - Good, even lighting for best results
 
 ### Installation
 
-```bash
+Run every command in PowerShell from the project root folder (the folder that contains `requirements.txt`).
+
+```powershell
 # 1. Clone the repository
-git clone https://github.com/<your-username>/FocusMate.git
+git clone https://github.com/RajHarsh03/FocusMate.git
 cd FocusMate
 
 # 2. Create and activate a virtual environment
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-# macOS / Linux
-source venv/bin/activate
+python -m venv .venv
+.venv\Scripts\activate
 
 # 3. Install dependencies
 pip install -r requirements.txt
 ```
 
-### MediaPipe model file
+- If activation says "running scripts is disabled", run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in the same window and activate again. This only affects the current window.
+- Next time you only need `.venv\Scripts\activate`.
+- Only Harsh edits `requirements.txt`. If you need a new library, ask Harsh. Everyone else pulls and runs `pip install -r requirements.txt` again.
 
-FocusMate uses the MediaPipe Face Landmarker (Tasks API). Download the `face_landmarker.task` model from the [MediaPipe documentation](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) and place it in the `models/` folder.
+### `requirements.txt`
 
-### Sample `requirements.txt`
+The five libraries are pinned to versions that were installed and tested together (Python 3.11.9, Windows):
 
 ```text
-opencv-python
-mediapipe
-streamlit
-matplotlib
-numpy
+opencv-python==5.0.0.93
+mediapipe==1.1.1
+streamlit==1.66.1
+numpy==2.4.6
+matplotlib==3.11.2
+```
+
+### MediaPipe model file
+
+The model is not installed by pip. Download `face_landmarker.task` from the [MediaPipe Face Landmarker page](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) and save it as `models/face_landmarker.task`. Or run:
+
+```powershell
+New-Item -ItemType Directory -Force models
+Invoke-WebRequest -Uri "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" -OutFile models\face_landmarker.task
+```
+
+Use only the MediaPipe Tasks API (`FaceLandmarker`). The old Face Mesh API is deprecated and must not be used.
+
+### Always start from the project root
+
+The database path is relative (`data/focusmate.db`). If you start a script from another folder, a second, empty database is created there.
+
+### Storage demo data and tests
+
+```powershell
+# Fill data/focusmate.db with 6 demo sessions (user name "demo") from the last 6 days.
+# Running it again replaces them. Real sessions are never touched.
+python src/storage/seed_demo_data.py
+
+# Storage tests (they use a temporary database, your real data is safe)
+python src/storage/test_database.py
+python src/storage/test_storage_extras.py
 ```
 
 ## Usage
 
-```bash
+```powershell
 streamlit run app.py
 ```
 
@@ -196,6 +223,26 @@ FocusMate stores everything in a local SQLite database with three main tables:
 | `focus_readings` | Time-stamped Focus Score readings logged during a session |
 | `break_events` | Breaks that were prompted, taken, or skipped |
 
+### Storage extras
+
+Extra storage functions for demos and analytics. The dashboard only calls these functions and never writes SQL.
+
+| Function | File | Input | Returns | Called by |
+|:---|:---|:---|:---|:---|
+| `seed_demo_sessions(count=6)` | `src/storage/seed_demo_data.py` | Number of sessions | List of new `session_id`s | Harsh before a demo (`python src/storage/seed_demo_data.py`), or an optional dashboard button |
+| `clear_demo_data()` | `src/storage/seed_demo_data.py` | None | Number of demo sessions removed | Harsh after a demo, or an optional dashboard button |
+| `make_focus_chart(session_id)` | `src/storage/charts.py` | `session_id` | matplotlib `Figure`, or `None` if the session has no readings | Dashboard (Ayush): summary and past sessions screens, with `st.pyplot(fig)` |
+| `get_overall_stats()` | `src/storage/analytics.py` | None | Dictionary: `total_sessions`, `total_study_sec`, `avg_focus`, `best_session` (session summary or `None`), `total_blinks` | Dashboard (Ayush): analytics area, `st.metric` |
+| `get_daily_summary(days=7)` | `src/storage/analytics.py` | Number of days | List of dictionaries, newest date first: `date`, `sessions`, `total_study_sec`, `avg_focus` | Dashboard (Ayush): analytics area, `st.dataframe` or `st.table` |
+| `export_session_csv(session_id, output_path=None)` | `src/storage/export.py` | `session_id`, optional file path | Path of the CSV file, or `None` if the session does not exist | Dashboard (Ayush): download button on the summary screen |
+
+Notes:
+
+- Check for `None` before calling `st.pyplot`.
+- Analytics count only ended sessions.
+- Demo sessions use the user name `demo`, and `clear_demo_data()` deletes every session with that name. Keep the default user name in the dashboard and do not let users type `demo`.
+- CSV files are saved in `data/exports/` by default. This folder is ignored by git.
+
 ---
 
 ## Project Status and Roadmap
@@ -203,10 +250,10 @@ FocusMate stores everything in a local SQLite database with three main tables:
 FocusMate is under active development. The original eight-week plan covers the foundation, and development continues until April 2027.
 
 - [x] Environment, repository, and folder structure
-- [x] Webcam capture and MediaPipe landmark extraction
-- [x] EAR calculation and blink detection
-- [x] Head-pose / gaze deviation estimation
-- [x] Streamlit dashboard shell with timer and controls
+- [ ] Webcam capture and MediaPipe landmark extraction
+- [ ] EAR calculation and blink detection
+- [ ] Head-pose / gaze deviation estimation
+- [ ] Streamlit dashboard shell with timer and controls
 - [x] SQLite schema with basic read/write functions
 - [ ] Focus Score formula with EMA smoothing
 - [ ] Full session state machine (Warning, Break Prompt)
