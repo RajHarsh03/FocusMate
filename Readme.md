@@ -230,10 +230,10 @@ FocusMate stores everything in a local SQLite database with three main tables:
 FocusMate is under active development. The original eight-week plan covers the foundation, and development continues until April 2027.
 
 - [x] Environment, repository, and folder structure
-- [x] Webcam capture and MediaPipe landmark extraction
-- [x] EAR calculation and blink detection
-- [x] Head-pose / gaze deviation estimation
-- [x] Streamlit dashboard shell with timer and controls
+- [ ] Webcam capture and MediaPipe landmark extraction
+- [ ] EAR calculation and blink detection
+- [ ] Head-pose / gaze deviation estimation
+- [ ] Streamlit dashboard shell with timer and controls
 - [x] SQLite schema with basic read/write functions
 - [ ] Focus Score formula with EMA smoothing
 - [ ] Full session state machine (Warning, Break Prompt)
