@@ -215,3 +215,70 @@ def _angles_to_direction(yaw, pitch):
     return "center"
 
 
+
+# ---------------------------------------------------------------------------
+# Demo block: python src/vision/vision.py
+# Opens the webcam, prints Contract A once per second, quits on 'q'.
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import time
+
+    print("Loading face landmarker ...")
+    try:
+        landmarker = create_landmarker()
+    except Exception as error:
+        print(f"Could not load model: {error}")
+        raise SystemExit(1)
+
+    cap = open_camera()
+    if cap is None:
+        print("Could not open webcam. Check that it is connected and not used by another app.")
+        raise SystemExit(1)
+
+    print("Webcam open. Press 'q' to quit.")
+    print("-" * 60)
+
+    last_print_time = 0.0
+    frame_count = 0
+    fps = 0.0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            print("Camera read failed. Stopping.")
+            break
+
+        output = process_frame(frame, landmarker)
+        frame_count += 1
+
+        # Print the result once per second so the terminal is readable.
+        now = time.monotonic()
+        elapsed = now - last_print_time
+        if elapsed >= 1.0:
+            fps = frame_count / elapsed
+            landmark_count = len(output["landmarks"]) if output["landmarks"] else 0
+            print(
+                f"face_detected={output['face_detected']!s:<5}  "
+                f"head_direction={output['head_direction']:<8}  "
+                f"yaw={str(round(output['yaw'], 1)) if output['yaw'] is not None else 'None':<7}  "
+                f"pitch={str(round(output['pitch'], 1)) if output['pitch'] is not None else 'None':<7}  "
+                f"landmarks={landmark_count}  "
+                f"fps={fps:.1f}"
+            )
+            frame_count = 0
+            last_print_time = now
+
+        # Show a live preview window with direction and FPS overlaid.
+        display = cv2.flip(frame, 1)
+        label = output["head_direction"].upper()
+        color = (0, 200, 0) if output["face_detected"] else (0, 0, 200)
+        cv2.putText(display, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 2)
+        cv2.putText(display, f"FPS: {fps:.1f}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
+        cv2.imshow("FocusMate - Vision Demo (press q to quit)", display)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    close_camera(cap)
+    cv2.destroyAllWindows()
+    print("Camera closed.")
