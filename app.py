@@ -1,65 +1,44 @@
-"""
-FocusMate dashboard (Streamlit). Owner: Ayush Kumar (2360060).
+"""FocusMate Streamlit dashboard. Owner: Ayush Kumar (2360060).
 
-Run from the project root (the folder that contains this file):
+Run from the project root:
     streamlit run app.py
 
-What this file does:
-    - Screen A: setup and live session (name, duration, Start and Stop, live
-      camera, big timer, "Focus (preview)" meter, status row).
-    - Screen B: end-of-session summary (numbers from the database, the focus
-      over time chart and a CSV download).
-    - Screen C: past sessions and simple analytics.
-    - The main loop from FocusMate-Module-Specs.md Section 7, which joins the
-      vision, detection, timer and storage modules together.
-
-What this file does NOT do (on purpose):
-    - No SQL. It only calls the storage functions.
-    - No EAR, blink, head pose or timer math. It only calls the other modules.
-    - No images are saved anywhere. Frames are only shown on screen.
-
-USE_MOCK switch:
-    True  -> use mock_modules.py (fake camera and fake data, works today
-             without the other members' code or a webcam).
-    False -> use the real modules from src/ (needs the vision, detection and
-             timer modules, plus models/face_landmarker.task).
+The dashboard joins the vision, detection, timer and storage modules. This file
+contains presentation and orchestration only. It does not contain SQL, EAR,
+head-pose, blink or focus-scoring logic.
 """
 
 import os
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
+import altair as alt
 import cv2
 import streamlit as st
 
+from ui import components as ui
+
 USE_MOCK = False
 
-# Study length choices. 1 minute is there for quick demos.
-DURATION_CHOICES = {
-    "1 minute": 60,
-    "5 minutes": 5 * 60,
-    "15 minutes": 15 * 60,
-    "25 minutes": 25 * 60,
+DURATION_OPTIONS = ("5 min", "15 min", "25 min", "45 min", "Custom")
+DURATION_SECONDS = {
+    "5 min": 5 * 60,
+    "15 min": 15 * 60,
+    "25 min": 25 * 60,
+    "45 min": 45 * 60,
 }
 DEFAULT_USER_NAME = "default"
-# clear_demo_data() deletes every session saved under this name, so real
-# users must never be saved with it.
 RESERVED_NAME = "demo"
-# Readings are saved to the database once per second, not on every frame.
 SAVE_INTERVAL_SEC = 1.0
 
 
 # ---------------------------------------------------------------------------
-# Loading the modules (mock or real)
+# Module loading
 # ---------------------------------------------------------------------------
 
 def load_modules(use_mock):
-    """Return (modules, error_text). All functions are reached as modules.<name>.
-
-    The dashboard code below never needs to know whether the functions are
-    fake or real, because both versions have the same names and formats.
-    """
+    """Return one namespace containing either fake or real module functions."""
     try:
         if use_mock:
             import mock_modules as mock
@@ -111,10 +90,8 @@ def load_modules(use_mock):
     except ImportError as error:
         return None, (
             f"Could not load the real modules ({error}). The dashboard needs "
-            "src/vision/vision.py, src/detection/ear_blink.py, "
-            "src/detection/focus_preview.py, src/timer/session_timer.py and "
-            "src/storage/. Set USE_MOCK = True at the top of app.py to run "
-            "with fake data instead."
+            "the vision, detection, timer and storage modules. Set USE_MOCK "
+            "to True at the top of app.py to run with fake data."
         )
 
 
@@ -123,30 +100,29 @@ fm, MODULES_ERROR = load_modules(USE_MOCK)
 
 @st.cache_resource(show_spinner="Loading the face landmark model...")
 def get_landmarker():
-    """Create the face landmarker once and reuse it on every rerun.
-
-    If loading fails, the error is raised (and not cached), so the next
-    Start press tries again, for example after the model file is added.
-    """
+    """Create the face landmarker once and reuse it on Streamlit reruns."""
     return fm.create_landmarker()
 
 
 # ---------------------------------------------------------------------------
-# Session state and small helpers
+# Session state and formatting
 # ---------------------------------------------------------------------------
 
 def init_state():
-    """Create every st.session_state value the dashboard uses, once."""
+    """Create every session-state value once."""
     defaults = {
-        "running": False,          # True while a session is live
-        "session_id": None,        # id of the current or last session
-        "timer": None,             # SessionTimer of the current session
-        "blink_detector": None,    # BlinkDetector of the current session
-        "last_save_time": 0.0,     # time.monotonic() of the last saved reading
-        "blinks_since_save": 0,    # blinks counted since the last saved reading
-        "cap": None,               # the open camera, or None
-        "summary_id": None,        # session whose summary is shown (Screen B)
-        "message": None,           # (kind, text) shown on the live tab
+        "running": False,
+        "session_id": None,
+        "timer": None,
+        "blink_detector": None,
+        "last_save_time": 0.0,
+        "blinks_since_save": 0,
+        "cap": None,
+        "summary_id": None,
+        "message": None,
+        "user_name": "",
+        "duration_choice": "25 min",
+        "custom_minutes": 10,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -154,23 +130,31 @@ def init_state():
 
 
 def clean_user_name(raw_name):
-    """Return (name to save, warning text or None) for the typed name."""
+    """Return the stored name and an optional warning for the typed name."""
     name = (raw_name or "").strip()
     if not name:
         return DEFAULT_USER_NAME, None
     if name.lower() == RESERVED_NAME:
         return DEFAULT_USER_NAME, (
-            f"The name '{RESERVED_NAME}' is kept for demo data. "
-            f"This session will be saved as '{DEFAULT_USER_NAME}'."
+            f"The name '{RESERVED_NAME}' is reserved for showcase data. "
+            f"This session will be stored without a display name."
         )
     return name, None
 
 
+def selected_duration_sec():
+    """Return the duration selected in the setup toolbar, in seconds."""
+    choice = st.session_state.duration_choice
+    if choice == "Custom":
+        return max(1, int(st.session_state.custom_minutes)) * 60
+    return DURATION_SECONDS[choice]
+
+
 def format_duration(seconds):
-    """Turn seconds into short text such as '12 min 05 s', or 'No data'."""
+    """Turn seconds into short, human-readable text."""
     if seconds is None:
-        return "No data"
-    seconds = int(seconds)
+        return "-"
+    seconds = max(0, int(seconds))
     hours, rest = divmod(seconds, 3600)
     minutes, secs = divmod(rest, 60)
     if hours:
@@ -180,25 +164,41 @@ def format_duration(seconds):
     return f"{secs} s"
 
 
-def format_number(value, digits):
-    """Round a number for display, or return 'No data' if it is missing."""
-    return "No data" if value is None else f"{value:.{digits}f}"
+def format_number(value, digits=1):
+    """Round a number for display, or return a quiet placeholder."""
+    return "-" if value is None else f"{value:.{digits}f}"
 
 
 def format_start_time(iso_text):
-    """Turn '2026-11-01T10:30:00' into '01 Nov 2026, 10:30'."""
+    """Turn ISO time into a full, readable date and time."""
     try:
         return datetime.fromisoformat(iso_text).strftime("%d %b %Y, %H:%M")
     except (TypeError, ValueError):
         return "Unknown"
 
 
+def relative_start_time(iso_text):
+    """Return a recent time such as 'Today, 21:40' or '29 Oct, 15:09'."""
+    try:
+        started = datetime.fromisoformat(iso_text)
+    except (TypeError, ValueError):
+        return "Unknown"
+    difference = (date.today() - started.date()).days
+    if difference == 0:
+        prefix = "Today"
+    elif difference == 1:
+        prefix = "Yesterday"
+    else:
+        prefix = started.strftime("%d %b")
+    return f"{prefix}, {started.strftime('%H:%M')}"
+
+
 # ---------------------------------------------------------------------------
-# Start and Stop (run as button callbacks, before the page is redrawn)
+# Session start and stop callbacks
 # ---------------------------------------------------------------------------
 
 def handle_start():
-    """Start button: open the camera, create the session and start the timer."""
+    """Open the camera, create a database session and start the timer."""
     state = st.session_state
     if state.running:
         return
@@ -206,23 +206,24 @@ def handle_start():
 
     try:
         get_landmarker()
-    except Exception as error:  # model file missing or broken
-        state.message = ("error",
-                         "The face landmark model could not be loaded "
-                         f"({error}). Check that models/face_landmarker.task "
-                         "exists (see the Readme for the download command).")
+    except Exception as error:
+        state.message = (
+            "error",
+            "The face landmark model could not be loaded "
+            f"({error}). Check models/face_landmarker.task.",
+        )
         return
 
     cap = fm.open_camera()
     if cap is None:
-        state.message = ("error",
-                         "The webcam could not be opened. Close other apps that "
-                         "use the camera (Zoom, Teams, the Camera app) and press "
-                         "Start again.")
+        state.message = (
+            "error",
+            "The webcam could not be opened. Close other camera apps and try again.",
+        )
         return
 
     user_name, _ = clean_user_name(state.user_name)
-    planned_sec = DURATION_CHOICES[state.duration_label]
+    planned_sec = selected_duration_sec()
 
     state.cap = cap
     state.timer = fm.SessionTimer(planned_sec)
@@ -237,7 +238,7 @@ def handle_start():
 
 
 def finish_session():
-    """End the running session: stop the timer, save the summary, free the camera."""
+    """Stop the timer, finish storage and release the camera."""
     state = st.session_state
     if state.timer is not None:
         state.timer.stop()
@@ -250,78 +251,176 @@ def finish_session():
 
 
 def handle_stop():
-    """Stop button: end the session early."""
+    """End a running session early."""
     if st.session_state.running:
         finish_session()
 
 
 # ---------------------------------------------------------------------------
-# Screen A: setup and live session
+# Idle session setup
 # ---------------------------------------------------------------------------
 
 def render_setup():
-    """Name box, duration choice and the Start and Stop buttons."""
-    running = st.session_state.running
-    col_name, col_duration = st.columns(2)
-    with col_name:
-        st.text_input("Your name (optional)", value=DEFAULT_USER_NAME,
-                      key="user_name", disabled=running, max_chars=40)
-    with col_duration:
-        st.selectbox("Session length", list(DURATION_CHOICES),
-                     key="duration_label", disabled=running)
+    """Render a single horizontal session toolbar."""
+    ui.section_header(
+        "Plan your session",
+        "Set a duration, then begin when you are ready.",
+    )
+    with st.container(border=True):
+        st.markdown('<div class="fm-toolbar-anchor"></div>', unsafe_allow_html=True)
+        name_col, duration_col, action_col = st.columns(
+            [1.35, 2.25, 0.9], gap="medium", vertical_alignment="bottom"
+        )
+        with name_col:
+            st.text_input(
+                "Name",
+                key="user_name",
+                placeholder="Optional",
+                max_chars=40,
+            )
+        with duration_col:
+            st.segmented_control(
+                "Duration",
+                DURATION_OPTIONS,
+                key="duration_choice",
+                selection_mode="single",
+                width="stretch",
+            )
+        with action_col:
+            st.button(
+                "Start session",
+                type="primary",
+                on_click=handle_start,
+                width="stretch",
+            )
 
-    _, warning = clean_user_name(st.session_state.user_name)
-    if warning and not running:
-        st.warning(warning)
+        if st.session_state.duration_choice == "Custom":
+            st.number_input(
+                "Custom duration (minutes)",
+                min_value=1,
+                max_value=180,
+                step=1,
+                key="custom_minutes",
+                width=220,
+            )
 
-    col_start, col_stop, _ = st.columns([1, 1, 4])
-    with col_start:
-        st.button("Start", type="primary", on_click=handle_start,
-                  disabled=running, width="stretch")
-    with col_stop:
-        st.button("Stop", on_click=handle_stop, disabled=not running,
-                  width="stretch")
+        _, warning = clean_user_name(st.session_state.user_name)
+        if warning:
+            st.warning(warning)
 
+
+# ---------------------------------------------------------------------------
+# Live session
+# ---------------------------------------------------------------------------
 
 def make_live_layout():
-    """Create the empty boxes that the live loop fills on every frame."""
-    col_video, col_info = st.columns([3, 2], gap="large")
-    with col_video:
-        video_box = st.empty()
-    with col_info:
-        status_box = st.empty()
-        timer_box = st.empty()
-        meter_box = st.empty()
-        details_box = st.empty()
-    return SimpleNamespace(video=video_box, status=status_box, timer=timer_box,
-                           meter=meter_box, details=details_box)
+    """Create stable placeholders for the camera and live signals."""
+    ui.section_header(
+        "Live session",
+        "Your signals update locally in real time. Nothing from the camera is recorded.",
+    )
+    camera_col, signal_col = st.columns([1.38, 1], gap="large", vertical_alignment="top")
+
+    with camera_col:
+        with st.container(border=True):
+            camera_status = st.empty()
+            camera_image = st.empty()
+
+    with signal_col:
+        with st.container(border=True):
+            st.markdown('<div class="fm-signal-anchor"></div>', unsafe_allow_html=True)
+            focus_col, timer_col = st.columns([1.1, 0.9], vertical_alignment="center")
+            focus_box = focus_col.empty()
+            timer_box = timer_col.empty()
+            notice_box = st.empty()
+            metrics_box = st.empty()
+            st.write("")
+            st.button(
+                "End session",
+                key="live_stop",
+                on_click=handle_stop,
+                type="secondary",
+                width="stretch",
+            )
+
+    return SimpleNamespace(
+        camera_status=camera_status,
+        camera_image=camera_image,
+        focus=focus_box,
+        timer=timer_box,
+        notice=notice_box,
+        metrics=metrics_box,
+    )
 
 
 def show_live_values(boxes, frame_bgr, vision, ear, preview):
-    """Draw one frame and the current numbers into the live boxes."""
+    """Update all stable live placeholders without changing their layout."""
     state = st.session_state
+    face_detected = bool(vision["face_detected"])
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    boxes.video.image(frame_rgb, channels="RGB", width="stretch")
-    boxes.status.markdown("**Session status:** :green[Active]")
-    boxes.timer.metric("Time left", state.timer.format_time(state.timer.remaining_sec()))
-    boxes.meter.progress(int(round(preview)),
-                         text=f"Focus (preview): {preview:.0f} / 100")
-    with boxes.details.container():
-        col_face, col_head = st.columns(2)
-        col_face.metric("Face", "Detected" if vision["face_detected"] else "Not detected")
-        col_head.metric("Head direction", vision["head_direction"].capitalize())
-        col_ear, col_blinks = st.columns(2)
-        col_ear.metric("Eye openness (EAR)", format_number(ear, 3))
-        col_blinks.metric("Blinks", state.blink_detector.total_blinks)
+    elapsed_text = state.timer.format_time(state.timer.elapsed_sec())
+
+    ui.camera_panel(
+        frame_rgb,
+        elapsed_text,
+        face_detected,
+        boxes.camera_status,
+        boxes.camera_image,
+    )
+    ui.focus_ring(preview, face_detected, boxes.focus)
+    ui.timer_display(
+        state.timer.format_time(state.timer.remaining_sec()),
+        elapsed_text,
+        boxes.timer,
+    )
+
+    if face_detected:
+        boxes.notice.empty()
+    else:
+        ui.inline_notice("Face not detected. Move gently into the camera frame.", boxes.notice)
+
+    direction_labels = {
+        "center": "Centered",
+        "left": "Left",
+        "right": "Right",
+        "up": "Up",
+        "down": "Down",
+        "unknown": "-",
+    }
+    direction = direction_labels.get(vision["head_direction"], "-")
+    ui.metric_grid(
+        [
+            {
+                "label": "Face",
+                "value": "Detected" if face_detected else "No face",
+                "caption": "Tracking normally" if face_detected else "Waiting for face",
+                "muted": not face_detected,
+            },
+            {
+                "label": "Head direction",
+                "value": direction,
+                "caption": "Relative to the screen" if face_detected else "Waiting for face",
+                "muted": direction == "-",
+            },
+            {
+                "label": "Eye openness (EAR)",
+                "value": format_number(ear, 3),
+                "caption": "Current eye signal" if ear is not None else "Waiting for face",
+                "muted": ear is None,
+            },
+            {
+                "label": "Blinks",
+                "value": state.blink_detector.total_blinks,
+                "caption": "This session",
+                "muted": False,
+            },
+        ],
+        boxes.metrics,
+    )
 
 
 def run_live_loop(boxes):
-    """The main loop (spec Section 7). Runs until Stop or the timer ends.
-
-    Pressing Stop makes Streamlit stop this loop and rerun the script, and
-    handle_stop() then ends the session. When the timer runs out, the loop
-    ends the session itself and reruns the page to show the summary.
-    """
+    """Run the module integration loop until Stop or timer completion."""
     state = st.session_state
     landmarker = get_landmarker()
 
@@ -332,123 +431,427 @@ def run_live_loop(boxes):
 
         ok, frame = state.cap.read()
         if not ok or frame is None:
-            state.message = ("error",
-                             "The webcam stopped sending pictures, so the session "
-                             "was ended. Your readings up to now are saved.")
+            state.message = (
+                "error",
+                "The webcam stopped sending pictures. The readings saved so far are safe.",
+            )
             finish_session()
             st.rerun()
 
-        frame = cv2.flip(frame, 1)  # mirror view, like looking in a mirror
-
-        vision = fm.process_frame(frame, landmarker)                 # Contract A
-        ear = fm.compute_ear(vision["landmarks"])                     # None if no face
+        frame = cv2.flip(frame, 1)
+        vision = fm.process_frame(frame, landmarker)
+        ear = fm.compute_ear(vision["landmarks"])
         if state.blink_detector.update(ear):
             state.blinks_since_save += 1
-        preview = fm.compute_focus_preview(vision["face_detected"], ear,
-                                           vision["head_direction"])
+        preview = fm.compute_focus_preview(
+            vision["face_detected"], ear, vision["head_direction"]
+        )
 
         show_live_values(boxes, frame, vision, ear, preview)
 
         now = time.monotonic()
         if now - state.last_save_time >= SAVE_INTERVAL_SEC:
-            fm.save_reading(state.session_id, {                       # Contract B
-                "face_detected": vision["face_detected"],
-                "ear": ear,
-                "blinks_in_interval": state.blinks_since_save,
-                "head_direction": vision["head_direction"],
-                "focus_preview": preview,
-                "elapsed_sec": state.timer.elapsed_sec(),
-            })
+            fm.save_reading(
+                state.session_id,
+                {
+                    "face_detected": vision["face_detected"],
+                    "ear": ear,
+                    "blinks_in_interval": state.blinks_since_save,
+                    "head_direction": vision["head_direction"],
+                    "focus_preview": preview,
+                    "elapsed_sec": state.timer.elapsed_sec(),
+                },
+            )
             state.blinks_since_save = 0
             state.last_save_time = now
 
 
 # ---------------------------------------------------------------------------
-# Screen B: end-of-session summary
+# Completed session
 # ---------------------------------------------------------------------------
 
+def style_session_figure(figure):
+    """Apply the active UI theme to the Matplotlib session chart."""
+    theme_type = st.context.theme.get("type") or "dark"
+    if theme_type == "light":
+        text_color = "#5F6672"
+        border_color = "#D9DDE5"
+        accent = "#4F6FE8"
+    else:
+        text_color = "#A7ADB7"
+        border_color = "#30343C"
+        accent = "#6C8CFF"
+
+    figure.patch.set_alpha(0)
+    for axis in figure.axes:
+        axis.set_facecolor("none")
+        axis.title.set_color(text_color)
+        axis.xaxis.label.set_color(text_color)
+        axis.yaxis.label.set_color(text_color)
+        axis.tick_params(colors=text_color)
+        for spine in axis.spines.values():
+            spine.set_color(border_color)
+        axis.grid(True, color=border_color, alpha=0.55, linewidth=0.7)
+        for index, line in enumerate(axis.lines):
+            line.set_color(accent)
+            line.set_alpha(0.25 if index == 0 else 1.0)
+        legend = axis.get_legend()
+        if legend is not None:
+            legend.get_frame().set_facecolor("none")
+            legend.get_frame().set_edgecolor(border_color)
+            for label in legend.get_texts():
+                label.set_color(text_color)
+    return figure
+
+
 def render_summary(session_id):
-    """Show the Contract C numbers, the focus chart and a CSV download."""
+    """Show one completed session, its chart and CSV download."""
     summary = fm.get_session_summary(session_id)
     if summary is None:
-        st.info("The summary of this session could not be found.")
+        ui.empty_state(
+            "Summary unavailable",
+            "The completed session could not be found.",
+            compact=True,
+        )
         return
 
-    st.subheader("Session summary")
-    st.caption(f"Session {summary['session_id']} | {summary['user_name']} | "
-               f"started {format_start_time(summary['start_time'])} | "
-               f"planned {format_duration(summary['planned_duration_sec'])}")
+    ui.section_header(
+        "Session complete",
+        f"Started {format_start_time(summary['start_time'])} | "
+        f"Planned for {format_duration(summary['planned_duration_sec'])}",
+        kicker="Saved locally",
+    )
 
-    row_one = st.columns(3)
-    row_one[0].metric("Total time studied", format_duration(summary["actual_duration_sec"]))
-    row_one[1].metric("Average EAR", format_number(summary["avg_ear"], 3))
-    row_one[2].metric("Total blinks", summary["total_blinks"] or 0)
-    row_two = st.columns(3)
-    row_two[0].metric("Time with no face", format_duration(summary["face_missing_sec"]))
-    row_two[1].metric("Time looking away", format_duration(summary["looking_away_sec"]))
-    row_two[2].metric("Average focus (preview)",
-                      format_number(summary["avg_focus_preview"], 1))
+    focus_col, time_col, blink_col, away_col = st.columns([1.25, 1, 1, 1])
+    with focus_col:
+        ui.stat_card(
+            "Average focus",
+            format_number(summary["avg_focus_preview"], 0),
+            "Session score",
+            hero=True,
+        )
+    with time_col:
+        ui.stat_card("Study time", format_duration(summary["actual_duration_sec"]))
+    with blink_col:
+        ui.stat_card("Blinks", summary["total_blinks"] or 0)
+    with away_col:
+        ui.stat_card("Looking away", format_duration(summary["looking_away_sec"]))
 
-    fig = fm.make_focus_chart(session_id)
-    if fig is None:
-        st.info("No readings were saved for this session, so there is no chart.")
-    else:
-        st.pyplot(fig)
+    detail_cols = st.columns(2)
+    with detail_cols[0]:
+        st.caption(f"Average EAR: {format_number(summary['avg_ear'], 3)}")
+    with detail_cols[1]:
+        st.caption(f"Face outside frame: {format_duration(summary['face_missing_sec'])}")
+
+    st.write("")
+    chart_title_col, chart_action_col = st.columns(
+        [4, 1.25], gap="medium", vertical_alignment="bottom"
+    )
+    with chart_title_col:
+        ui.section_header(
+            "Focus over time",
+            "Gaps show moments when a face was not available.",
+        )
 
     csv_path = fm.export_session_csv(session_id)
     if csv_path is not None and os.path.exists(csv_path):
-        with open(csv_path, "rb") as handle:
-            st.download_button("Download readings (CSV)", data=handle.read(),
-                               file_name=os.path.basename(csv_path),
-                               mime="text/csv")
+        with chart_action_col:
+            with open(csv_path, "rb") as handle:
+                st.download_button(
+                    "Download session data",
+                    data=handle.read(),
+                    file_name=os.path.basename(csv_path),
+                    mime="text/csv",
+                    width="stretch",
+                )
 
-    st.caption("To study again, choose a length and press Start above.")
+    fig = fm.make_focus_chart(session_id)
+    if fig is None:
+        ui.empty_state(
+            "No focus readings",
+            "This session ended before enough readings were saved.",
+            compact=True,
+        )
+    else:
+        st.pyplot(style_session_figure(fig), width="stretch")
 
 
 # ---------------------------------------------------------------------------
-# Screen C: past sessions and analytics
+# History and analytics
 # ---------------------------------------------------------------------------
+
+def _session_day(session):
+    """Return a session start date, or None for invalid data."""
+    try:
+        return datetime.fromisoformat(session["start_time"]).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _period_sessions(sessions, first_offset, last_offset):
+    """Return ended sessions whose dates are within day offsets from today."""
+    newest = date.today() - timedelta(days=first_offset)
+    oldest = date.today() - timedelta(days=last_offset)
+    return [
+        session
+        for session in sessions
+        if session["status"] == "ended"
+        and _session_day(session) is not None
+        and oldest <= _session_day(session) <= newest
+    ]
+
+
+def _sum_value(sessions, key):
+    """Sum non-empty numeric values from session dictionaries."""
+    return sum((session.get(key) or 0) for session in sessions)
+
+
+def _average_value(sessions, key):
+    """Average non-empty numeric values, or return None."""
+    values = [session.get(key) for session in sessions if session.get(key) is not None]
+    return sum(values) / len(values) if values else None
+
+
+def _delta_text(current, previous, unit=""):
+    """Describe the difference from the previous seven-day period."""
+    if previous is None or current is None:
+        return "No previous period"
+    difference = current - previous
+    sign = "+" if difference > 0 else ""
+    if isinstance(current, int) and isinstance(previous, int):
+        number = f"{difference:d}"
+    else:
+        number = f"{difference:.1f}"
+    suffix = f" {unit}" if unit else ""
+    return f"{sign}{number}{suffix} vs previous 7 days"
+
+
+def _daily_series(sessions, key, average=False):
+    """Return seven values, oldest to newest, filling days without data with 0."""
+    values = []
+    for offset in range(6, -1, -1):
+        day = date.today() - timedelta(days=offset)
+        on_day = [session for session in sessions if _session_day(session) == day]
+        value = _average_value(on_day, key) if average else _sum_value(on_day, key)
+        values.append(0 if value is None else value)
+    return values
+
+
+def render_history_chart(daily_rows):
+    """Show seven distinct day slots with visible focus bars."""
+    if not daily_rows:
+        ui.empty_state(
+            "No focus trend yet",
+            "Complete a session to begin building your seven-day view.",
+            compact=True,
+        )
+        return
+
+    rows_by_date = {row["date"]: row for row in daily_rows}
+    values = []
+    date_order = []
+    for offset in range(6, -1, -1):
+        day = date.today() - timedelta(days=offset)
+        date_label = day.strftime("%d %b")
+        date_order.append(date_label)
+        row = rows_by_date.get(day.isoformat())
+        focus = round(row["avg_focus"], 1) if row and row["avg_focus"] is not None else 0
+        values.append(
+            {
+                "date_label": date_label,
+                "focus": focus,
+                "focus_label": f"{focus:.0f}" if row else "",
+                "availability": "Session recorded" if row else "No session",
+                "sessions": row["sessions"] if row else 0,
+                "study_minutes": round(row["total_study_sec"] / 60, 1) if row else 0,
+                "track": 100,
+            }
+        )
+
+    theme_type = st.context.theme.get("type") or "dark"
+    axis_color = "#5F6672" if theme_type == "light" else "#A7ADB7"
+    track_color = "#E7EAF0" if theme_type == "light" else "#242831"
+    bar_color = "#4F6FE8" if theme_type == "light" else "#6C8CFF"
+
+    data = alt.Data(values=values)
+    x_axis = alt.X(
+        "date_label:N",
+        title=None,
+        sort=date_order,
+        axis=alt.Axis(labelAngle=0),
+    )
+    y_scale = alt.Scale(domain=[0, 100])
+
+    tracks = alt.Chart(data).mark_bar(
+        color=track_color,
+        cornerRadiusTopLeft=5,
+        cornerRadiusTopRight=5,
+        size=54,
+    ).encode(
+        x=x_axis,
+        y=alt.Y("track:Q", title="Average focus", scale=y_scale),
+    )
+    bars = alt.Chart(data).mark_bar(
+        color=bar_color,
+        cornerRadiusTopLeft=5,
+        cornerRadiusTopRight=5,
+        size=54,
+    ).encode(
+        x=x_axis,
+        y=alt.Y("focus:Q", title="Average focus", scale=y_scale),
+        tooltip=[
+            alt.Tooltip("date_label:N", title="Date"),
+            alt.Tooltip("availability:N", title="Activity"),
+            alt.Tooltip("focus:Q", title="Average focus", format=".1f"),
+            alt.Tooltip("sessions:Q", title="Sessions"),
+            alt.Tooltip("study_minutes:Q", title="Study minutes", format=".1f"),
+        ],
+    )
+    labels = alt.Chart(data).mark_text(
+        color=axis_color,
+        dy=-10,
+        fontSize=12,
+        fontWeight=600,
+    ).encode(
+        x=x_axis,
+        y=alt.Y("focus:Q", scale=y_scale),
+        text="focus_label:N",
+    )
+
+    chart = (
+        (tracks + bars + labels)
+        .properties(height=245, background="transparent")
+        .configure_view(strokeOpacity=0)
+        .configure_axis(
+            grid=False,
+            domain=False,
+            tickSize=0,
+            labelPadding=9,
+            titlePadding=14,
+            labelColor=axis_color,
+            titleColor=axis_color,
+        )
+    )
+    st.altair_chart(chart, width="stretch", theme=None)
+
+
+def render_recent_sessions(sessions):
+    """Show recent sessions with relative time and a focus progress column."""
+    if not sessions:
+        ui.empty_state(
+            "No sessions yet",
+            "Your completed sessions will appear here automatically.",
+            compact=True,
+        )
+        return
+
+    rows = []
+    for session in sessions[:20]:
+        rows.append(
+            {
+                "When": relative_start_time(session["start_time"]),
+                "Duration": format_duration(session["actual_duration_sec"]),
+                "Focus": session["avg_focus_preview"],
+                "Status": "Complete" if session["status"] == "ended" else "In progress",
+            }
+        )
+
+    st.dataframe(
+        rows,
+        hide_index=True,
+        width="stretch",
+        row_height=42,
+        column_config={
+            "When": st.column_config.TextColumn("When", width="medium"),
+            "Duration": st.column_config.TextColumn("Duration", width="small"),
+            "Focus": st.column_config.ProgressColumn(
+                "Focus", min_value=0, max_value=100, format="%.0f", width="medium"
+            ),
+            "Status": st.column_config.TextColumn("Status", width="small"),
+        },
+    )
+
 
 def render_past_sessions():
-    """Show overall numbers, the last 7 days and a table of recent sessions."""
+    """Render the focus history with hierarchy, deltas, chart and session list."""
     stats = fm.get_overall_stats()
-    st.subheader("All finished sessions")
-    cols = st.columns(4)
-    cols[0].metric("Sessions", stats["total_sessions"])
-    cols[1].metric("Total study time", format_duration(stats["total_study_sec"]))
-    cols[2].metric("Average focus (preview)", format_number(stats["avg_focus"], 1))
-    cols[3].metric("Total blinks", stats["total_blinks"])
+    all_sessions = fm.list_sessions(limit=200)
+    ended = [session for session in all_sessions if session["status"] == "ended"]
+
+    ui.section_header(
+        "Focus history",
+        "A clear view of completed sessions and recent study patterns.",
+    )
+
+    if stats["total_sessions"] == 0:
+        ui.empty_state(
+            "Your history starts with one session",
+            "Complete a focus session and this page will show trends, totals and recent activity.",
+            "Measures focus, study time, blinks and attention changes",
+        )
+        return
+
+    current = _period_sessions(ended, 0, 6)
+    previous = _period_sessions(ended, 7, 13)
+    current_focus = _average_value(current, "avg_focus_preview")
+    previous_focus = _average_value(previous, "avg_focus_preview")
+
+    focus_series = _daily_series(ended, "avg_focus_preview", average=True)
+    session_series = [
+        len(_period_sessions(ended, offset, offset)) for offset in range(6, -1, -1)
+    ]
+    time_series = _daily_series(ended, "actual_duration_sec")
+    blink_series = _daily_series(ended, "total_blinks")
+
+    focus_col, sessions_col, time_col, blinks_col = st.columns([1.35, 1, 1, 1])
+    with focus_col:
+        ui.stat_card(
+            "Average focus",
+            format_number(stats["avg_focus"], 0),
+            _delta_text(current_focus, previous_focus, "pts"),
+            focus_series,
+            hero=True,
+        )
+    with sessions_col:
+        ui.stat_card(
+            "Sessions",
+            stats["total_sessions"],
+            _delta_text(len(current), len(previous)),
+            session_series,
+        )
+    with time_col:
+        ui.stat_card(
+            "Study time",
+            format_duration(stats["total_study_sec"]),
+            _delta_text(_sum_value(current, "actual_duration_sec") // 60,
+                        _sum_value(previous, "actual_duration_sec") // 60,
+                        "min"),
+            time_series,
+        )
+    with blinks_col:
+        ui.stat_card(
+            "Blinks",
+            stats["total_blinks"],
+            _delta_text(_sum_value(current, "total_blinks"),
+                        _sum_value(previous, "total_blinks")),
+            blink_series,
+        )
+
     best = stats["best_session"]
     if best is not None:
-        st.caption(f"Best session: {format_start_time(best['start_time'])}, "
-                   f"average focus {best['avg_focus_preview']:.1f}")
+        st.markdown(
+            '<div class="fm-best-session">Best session: '
+            f"{relative_start_time(best['start_time'])} with a focus score of "
+            f"{best['avg_focus_preview']:.0f}</div>",
+            unsafe_allow_html=True,
+        )
 
-    st.subheader("Last 7 days")
-    days = fm.get_daily_summary(7)
-    if days:
-        st.dataframe([
-            {"Date": day["date"],
-             "Sessions": day["sessions"],
-             "Study time": format_duration(day["total_study_sec"]),
-             "Average focus": format_number(day["avg_focus"], 1)}
-            for day in days
-        ], hide_index=True)
-    else:
-        st.info("No finished sessions in the last 7 days.")
+    ui.section_header("Last 7 days", "Daily average focus across completed sessions.")
+    render_history_chart(fm.get_daily_summary(7))
 
-    st.subheader("Recent sessions")
-    sessions = fm.list_sessions(limit=20)
-    if sessions:
-        st.dataframe([
-            {"Date": format_start_time(s["start_time"]),
-             "Name": s["user_name"],
-             "Duration": format_duration(s["actual_duration_sec"]),
-             "Average focus": format_number(s["avg_focus_preview"], 1),
-             "Status": s["status"].capitalize()}
-            for s in sessions
-        ], hide_index=True)
-    else:
-        st.info("No sessions yet. Start one on the Live session tab.")
+    st.write("")
+    ui.section_header("Recent sessions", "Latest completed and in-progress sessions.")
+    render_recent_sessions(all_sessions)
 
 
 # ---------------------------------------------------------------------------
@@ -456,47 +859,49 @@ def render_past_sessions():
 # ---------------------------------------------------------------------------
 
 def main():
-    """Build the page. Streamlit runs this from the top on every interaction."""
+    """Build the page. Streamlit reruns this on every interaction."""
     st.set_page_config(page_title="FocusMate", layout="wide")
-    st.title("FocusMate")
-    st.caption("AI-powered focus and productivity monitor. Everything runs on "
-               "this laptop. No video is saved or uploaded.")
+    ui.load_css()
+    ui.sync_browser_theme()
+    ui.hero()
 
     if MODULES_ERROR:
         st.error(MODULES_ERROR)
         st.stop()
 
     if USE_MOCK:
-        st.info("Mock mode: the camera and all numbers are fake test data, "
-                "and nothing is saved to the database.")
+        st.info("Mock mode is active. Camera signals are simulated and not saved.")
     elif os.path.abspath(os.getcwd()) != os.path.dirname(os.path.abspath(__file__)):
-        st.warning("Start the app from the project root (the folder with "
-                   "app.py), otherwise a second, empty database is created.")
+        st.warning("Start the app from the project root so it uses the correct database.")
 
     init_state()
     fm.init_db()
 
-    live_tab, past_tab = st.tabs(["Live session", "Past sessions"])
+    live_tab, history_tab = st.tabs(["Live session", "History"])
 
-    # The past sessions tab is drawn first, because the live loop below keeps
-    # running and nothing after it would be drawn until the session ends.
-    with past_tab:
+    # Draw history first because the live loop holds the script while running.
+    with history_tab:
         render_past_sessions()
 
     with live_tab:
-        render_setup()
         state = st.session_state
         if state.message:
-            kind, text = state.message
-            (st.error if kind == "error" else st.info)(text)
+            kind, message = state.message
+            (st.error if kind == "error" else st.info)(message)
 
         if state.running:
             run_live_loop(make_live_layout())
-        elif state.summary_id is not None:
-            render_summary(state.summary_id)
         else:
-            st.info("Choose a session length and press Start. Allow camera "
-                    "access if Windows asks.")
+            render_setup()
+            if state.summary_id is not None:
+                st.write("")
+                render_summary(state.summary_id)
+            else:
+                ui.empty_state(
+                    "Ready when you are",
+                    "A session measures your eye openness, head direction and blink pattern in real time.",
+                    "Camera stays on-device | Readings are stored locally",
+                )
 
 
 if __name__ == "__main__":
