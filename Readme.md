@@ -174,7 +174,9 @@ matplotlib==3.11.2
 
 ### MediaPipe model file
 
-The model is not installed by pip. Download `face_landmarker.task` from the [MediaPipe Face Landmarker page](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) and save it as `models/face_landmarker.task`. Or run:
+The model file `models/face_landmarker.task` is included in the repository, so it is already there after you clone or pull. It is not installed by pip.
+
+If the file is missing or broken, download it again from the [MediaPipe Face Landmarker page](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) and save it as `models/face_landmarker.task`, or run:
 
 ```powershell
 New-Item -ItemType Directory -Force models
