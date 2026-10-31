@@ -20,6 +20,12 @@ import streamlit as st
 from ui import components as ui
 
 USE_MOCK = False
+USE_ADAPTIVE_SESSION_FLOW = True
+
+# A dismissed break suggestion waits this long before focus-state checks resume.
+CONTINUE_COOLDOWN_SEC = 30.0
+# Missing face shows an inline notice immediately and one toast after this delay.
+FACE_MISSING_TOAST_SEC = 5.0
 
 DURATION_OPTIONS = ("5 min", "15 min", "25 min", "45 min", "Custom")
 DURATION_SECONDS = {
@@ -40,6 +46,10 @@ SAVE_INTERVAL_SEC = 1.0
 def load_modules(use_mock):
     """Return one namespace containing either fake or real module functions."""
     try:
+        # The full scorer and state machine work with real or mocked signals.
+        from src.detection.focus_score import FocusScorer
+        from src.timer.session_state import SessionState, SessionStateMachine
+
         if use_mock:
             import mock_modules as mock
             return SimpleNamespace(
@@ -50,6 +60,9 @@ def load_modules(use_mock):
                 compute_ear=mock.compute_ear,
                 BlinkDetector=mock.BlinkDetector,
                 compute_focus_preview=mock.compute_focus_preview,
+                FocusScorer=FocusScorer,
+                SessionState=SessionState,
+                SessionStateMachine=SessionStateMachine,
                 SessionTimer=mock.SessionTimer,
                 init_db=mock.init_db,
                 start_session=mock.start_session,
@@ -75,6 +88,9 @@ def load_modules(use_mock):
             compute_ear=ear_blink.compute_ear,
             BlinkDetector=ear_blink.BlinkDetector,
             compute_focus_preview=focus_preview.compute_focus_preview,
+            FocusScorer=FocusScorer,
+            SessionState=SessionState,
+            SessionStateMachine=SessionStateMachine,
             SessionTimer=session_timer.SessionTimer,
             init_db=database.init_db,
             start_session=database.start_session,
@@ -115,6 +131,14 @@ def init_state():
         "session_id": None,
         "timer": None,
         "blink_detector": None,
+        "focus_scorer": None,
+        "session_machine": None,
+        "adaptive_state": "active",
+        "break_prompt_visible": False,
+        "continue_cooldown_until": 0.0,
+        "face_missing_since": None,
+        "face_missing_toast_sent": False,
+        "pending_toast": None,
         "last_save_time": 0.0,
         "blinks_since_save": 0,
         "cap": None,
@@ -229,10 +253,25 @@ def handle_start():
     state.timer = fm.SessionTimer(planned_sec)
     state.blink_detector = fm.BlinkDetector()
     state.blink_detector.reset()
+    state.focus_scorer = fm.FocusScorer() if USE_ADAPTIVE_SESSION_FLOW else None
+    if state.focus_scorer is not None:
+        state.focus_scorer.reset()
+        state.session_machine = fm.SessionStateMachine(timer=state.timer)
+        # The state machine starts the shared timer. SessionTimer.start() is
+        # idempotent, so the stable fallback can still start it directly.
+        state.session_machine.start()
+    else:
+        state.session_machine = None
+        state.timer.start()
     state.session_id = fm.start_session(user_name, planned_sec)
-    state.timer.start()
     state.last_save_time = time.monotonic()
     state.blinks_since_save = 0
+    state.adaptive_state = "active"
+    state.break_prompt_visible = False
+    state.continue_cooldown_until = 0.0
+    state.face_missing_since = None
+    state.face_missing_toast_sent = False
+    state.pending_toast = None
     state.summary_id = None
     state.running = True
 
@@ -240,13 +279,17 @@ def handle_start():
 def finish_session():
     """Stop the timer, finish storage and release the camera."""
     state = st.session_state
-    if state.timer is not None:
+    if state.session_machine is not None:
+        state.session_machine.stop()
+    elif state.timer is not None:
         state.timer.stop()
     if state.session_id is not None:
         fm.end_session(state.session_id)
     fm.close_camera(state.cap)
     state.cap = None
     state.running = False
+    state.break_prompt_visible = False
+    state.adaptive_state = "ended"
     state.summary_id = state.session_id
 
 
@@ -254,6 +297,29 @@ def handle_stop():
     """End a running session early."""
     if st.session_state.running:
         finish_session()
+
+
+def handle_continue_session():
+    """Dismiss a break suggestion and pause state checks for 30 seconds."""
+    state = st.session_state
+    if not state.running or state.timer is None:
+        return
+    state.break_prompt_visible = False
+    state.continue_cooldown_until = state.timer.elapsed_sec() + CONTINUE_COOLDOWN_SEC
+    state.session_machine = fm.SessionStateMachine(timer=state.timer)
+    state.session_machine.start()
+    state.adaptive_state = "active"
+    state.pending_toast = "Session continued. Focus checks resume in 30 seconds."
+
+
+def handle_take_break():
+    """End the current session after the user accepts the break suggestion."""
+    if st.session_state.running:
+        finish_session()
+        st.session_state.message = (
+            "info",
+            "Session saved. Take a short break and return when you feel ready.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -335,13 +401,33 @@ def make_live_layout():
             notice_box = st.empty()
             metrics_box = st.empty()
             st.write("")
-            st.button(
-                "End session",
-                key="live_stop",
-                on_click=handle_stop,
-                type="secondary",
-                width="stretch",
-            )
+            if st.session_state.break_prompt_visible:
+                ui.break_prompt()
+                continue_col, break_col = st.columns(2)
+                with continue_col:
+                    st.button(
+                        "Continue session",
+                        key="continue_after_prompt",
+                        on_click=handle_continue_session,
+                        type="primary",
+                        width="stretch",
+                    )
+                with break_col:
+                    st.button(
+                        "End and take a break",
+                        key="accept_break_prompt",
+                        on_click=handle_take_break,
+                        type="secondary",
+                        width="stretch",
+                    )
+            else:
+                st.button(
+                    "End session",
+                    key="live_stop",
+                    on_click=handle_stop,
+                    type="secondary",
+                    width="stretch",
+                )
 
     return SimpleNamespace(
         camera_status=camera_status,
@@ -353,8 +439,8 @@ def make_live_layout():
     )
 
 
-def show_live_values(boxes, frame_bgr, vision, ear, preview):
-    """Update all stable live placeholders without changing their layout."""
+def show_live_values(boxes, frame_bgr, vision, ear, focus_score, session_state):
+    """Update stable live placeholders with the full score and state."""
     state = st.session_state
     face_detected = bool(vision["face_detected"])
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -367,17 +453,43 @@ def show_live_values(boxes, frame_bgr, vision, ear, preview):
         boxes.camera_status,
         boxes.camera_image,
     )
-    ui.focus_ring(preview, face_detected, boxes.focus)
+    ui.focus_ring(
+        focus_score,
+        face_detected,
+        boxes.focus,
+        state=session_state,
+    )
     ui.timer_display(
         state.timer.format_time(state.timer.remaining_sec()),
         elapsed_text,
         boxes.timer,
     )
 
-    if face_detected:
-        boxes.notice.empty()
+    if not face_detected:
+        ui.inline_notice(
+            "Face not detected. Move gently into the camera frame.",
+            boxes.notice,
+        )
+    elif session_state == "break_prompt":
+        ui.inline_notice(
+            "Your focus has stayed low. Choose whether to continue or take a break.",
+            boxes.notice,
+            tone="warning",
+        )
+    elif session_state == "warning":
+        ui.inline_notice(
+            "Focus is dropping. Look towards the screen and adjust your posture.",
+            boxes.notice,
+            tone="warning",
+        )
+    elif state.timer.elapsed_sec() < state.continue_cooldown_until:
+        seconds_left = int(state.continue_cooldown_until - state.timer.elapsed_sec())
+        ui.inline_notice(
+            f"Continuing by choice. Focus checks resume in {seconds_left} seconds.",
+            boxes.notice,
+        )
     else:
-        ui.inline_notice("Face not detected. Move gently into the camera frame.", boxes.notice)
+        boxes.notice.empty()
 
     direction_labels = {
         "center": "Centered",
@@ -388,13 +500,19 @@ def show_live_values(boxes, frame_bgr, vision, ear, preview):
         "unknown": "-",
     }
     direction = direction_labels.get(vision["head_direction"], "-")
+    state_labels = {
+        "active": "Active",
+        "warning": "Warning",
+        "break_prompt": "Break suggested",
+        "ended": "Ended",
+    }
     ui.metric_grid(
         [
             {
-                "label": "Face",
-                "value": "Detected" if face_detected else "No face",
-                "caption": "Tracking normally" if face_detected else "Waiting for face",
-                "muted": not face_detected,
+                "label": "Session state",
+                "value": state_labels.get(session_state, "Active"),
+                "caption": "Based on sustained focus",
+                "muted": False,
             },
             {
                 "label": "Head direction",
@@ -419,8 +537,64 @@ def show_live_values(boxes, frame_bgr, vision, ear, preview):
     )
 
 
+def _track_face_presence(face_detected, elapsed):
+    """Track face gaps, show one toast and reset stale decision dwell on return."""
+    state = st.session_state
+    if face_detected:
+        if state.face_missing_since is not None:
+            missing_for = elapsed - state.face_missing_since
+            if missing_for >= 1.0 and state.session_machine is not None:
+                # A face gap is missing evidence, not low focus. Start decision
+                # dwell fresh so time spent off-camera cannot trigger a warning.
+                state.session_machine = fm.SessionStateMachine(timer=state.timer)
+                state.session_machine.start()
+                state.adaptive_state = "active"
+                state.break_prompt_visible = False
+        state.face_missing_since = None
+        state.face_missing_toast_sent = False
+        return
+
+    if state.face_missing_since is None:
+        state.face_missing_since = elapsed
+        return
+
+    missing_for = elapsed - state.face_missing_since
+    if missing_for >= FACE_MISSING_TOAST_SEC and not state.face_missing_toast_sent:
+        st.toast("We cannot see you. Move back into the camera frame.")
+        state.face_missing_toast_sent = True
+
+
+def _handle_state_transition(status):
+    """React once when the state machine changes state."""
+    if not status.state_changed:
+        return
+
+    state = st.session_state
+    state.adaptive_state = status.state.value
+
+    if status.state is fm.SessionState.WARNING:
+        if status.previous_state is fm.SessionState.BREAK_PROMPT:
+            state.break_prompt_visible = False
+            state.pending_toast = "Focus is recovering."
+            st.rerun()
+        st.toast("Focus is dropping. Adjust your posture and look towards the screen.")
+
+    elif status.state is fm.SessionState.BREAK_PROMPT:
+        state.break_prompt_visible = True
+        state.pending_toast = "Your focus has stayed low. A short break may help."
+        st.rerun()
+
+    elif status.state is fm.SessionState.ACTIVE:
+        state.break_prompt_visible = False
+        st.toast("Focus recovered. Session is active again.")
+
+    elif status.state is fm.SessionState.ENDED:
+        finish_session()
+        st.rerun()
+
+
 def run_live_loop(boxes):
-    """Run the module integration loop until Stop or timer completion."""
+    """Run scoring, state decisions, storage and presentation until session end."""
     state = st.session_state
     landmarker = get_landmarker()
 
@@ -440,25 +614,60 @@ def run_live_loop(boxes):
 
         frame = cv2.flip(frame, 1)
         vision = fm.process_frame(frame, landmarker)
+        face_detected = bool(vision["face_detected"])
         ear = fm.compute_ear(vision["landmarks"])
         if state.blink_detector.update(ear):
             state.blinks_since_save += 1
-        preview = fm.compute_focus_preview(
-            vision["face_detected"], ear, vision["head_direction"]
-        )
 
-        show_live_values(boxes, frame, vision, ear, preview)
+        if USE_ADAPTIVE_SESSION_FLOW:
+            if face_detected:
+                focus_value = state.focus_scorer.update(
+                    True,
+                    ear,
+                    vision["head_direction"],
+                    vision.get("yaw"),
+                    vision.get("pitch"),
+                )
+            else:
+                # Keep the persisted no-face score consistent with Contract B,
+                # without pulling the EMA down and causing a false warning later.
+                focus_value = 0.0
+            elapsed = state.timer.elapsed_sec()
+            _track_face_presence(face_detected, elapsed)
+            in_cooldown = elapsed < state.continue_cooldown_until
+            # A missing face shows its own notice but does not count as evidence
+            # of low focus. A dismissed prompt gets a short decision cooldown.
+            decision_score = None if (not face_detected or in_cooldown) else focus_value
+            status = state.session_machine.update(decision_score)
+            state.adaptive_state = status.state.value
+            _handle_state_transition(status)
+        else:
+            focus_value = fm.compute_focus_preview(
+                face_detected, ear, vision["head_direction"]
+            )
+            state.adaptive_state = "active"
+
+        show_live_values(
+            boxes,
+            frame,
+            vision,
+            ear,
+            focus_value,
+            state.adaptive_state,
+        )
 
         now = time.monotonic()
         if now - state.last_save_time >= SAVE_INTERVAL_SEC:
             fm.save_reading(
                 state.session_id,
                 {
-                    "face_detected": vision["face_detected"],
+                    "face_detected": face_detected,
                     "ear": ear,
                     "blinks_in_interval": state.blinks_since_save,
                     "head_direction": vision["head_direction"],
-                    "focus_preview": preview,
+                    # Contract B keeps this historical key name. New adaptive
+                    # sessions store the smoothed full score in this field.
+                    "focus_preview": focus_value,
                     "elapsed_sec": state.timer.elapsed_sec(),
                 },
             )
@@ -876,6 +1085,10 @@ def main():
 
     init_state()
     fm.init_db()
+
+    if st.session_state.pending_toast:
+        st.toast(st.session_state.pending_toast)
+        st.session_state.pending_toast = None
 
     live_tab, history_tab = st.tabs(["Live session", "History"])
 
