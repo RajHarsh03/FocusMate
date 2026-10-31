@@ -612,8 +612,10 @@ def run_live_loop(boxes):
             finish_session()
             st.rerun()
 
-        frame = cv2.flip(frame, 1)
+        # Detect head direction on the original camera frame. Mirror only the
+        # displayed image, otherwise physical left and right become reversed.
         vision = fm.process_frame(frame, landmarker)
+        display_frame = cv2.flip(frame, 1)
         face_detected = bool(vision["face_detected"])
         ear = fm.compute_ear(vision["landmarks"])
         if state.blink_detector.update(ear):
@@ -649,7 +651,7 @@ def run_live_loop(boxes):
 
         show_live_values(
             boxes,
-            frame,
+            display_frame,
             vision,
             ear,
             focus_value,
