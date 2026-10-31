@@ -214,15 +214,20 @@ def metric_grid(items, target=None):
     _write(f'<div class="fm-metric-grid">{tiles}</div>', target)
 
 
-def focus_ring(score, face_detected=True, target=None):
-    """Render the live focus score as an SVG ring with a large fixed-width number."""
+def focus_ring(score, face_detected=True, target=None, state="active"):
+    """Render the full focus score and its current session state."""
     numeric = max(0.0, min(100.0, float(score or 0.0)))
     circumference = 2 * math.pi * 58
     offset = circumference * (1 - numeric / 100.0)
+    state_class = f" is-{state}" if state in ("warning", "break_prompt") else ""
     muted_class = " is-muted" if not face_detected else ""
     display = "-" if not face_detected else str(int(round(numeric)))
     if not face_detected:
         label = "Waiting for face"
+    elif state == "break_prompt":
+        label = "Break suggested"
+    elif state == "warning":
+        label = "Focus dropping"
     elif numeric >= 70:
         label = "Focused"
     elif numeric >= 40:
@@ -231,7 +236,7 @@ def focus_ring(score, face_detected=True, target=None):
         label = "Low attention"
     _write(
         f"""
-        <div class="fm-focus-ring-wrap{muted_class}">
+        <div class="fm-focus-ring-wrap{muted_class}{state_class}">
           <svg class="fm-focus-ring" viewBox="0 0 168 168" role="img" aria-label="Focus score {display}">
             <circle class="fm-ring-track" cx="84" cy="84" r="58"/>
             <circle class="fm-ring-value" cx="84" cy="84" r="58"
@@ -274,10 +279,28 @@ def camera_panel(frame_rgb, elapsed_text, face_detected, status_target, image_ta
     image_target.image(frame_rgb, channels="RGB", width="stretch")
 
 
-def inline_notice(text, target=None):
-    """Render a calm inline notice for a missing live signal."""
+def inline_notice(text, target=None, tone="neutral"):
+    """Render one calm inline notice for a live signal or state."""
     _write(
-        f'<div class="fm-inline-notice"><span class="fm-status-dot"></span><span>{_safe(text)}</span></div>',
+        f'<div class="fm-inline-notice is-{_safe(tone)}">'
+        f'<span class="fm-status-dot"></span><span>{_safe(text)}</span></div>',
+        target,
+    )
+
+
+def break_prompt(target=None):
+    """Render the persistent advisory shown after sustained low focus."""
+    _write(
+        """
+        <div class="fm-break-prompt">
+          <div class="fm-break-prompt-label">Break suggestion</div>
+          <div class="fm-break-prompt-title">A short break may help</div>
+          <div class="fm-break-prompt-copy">
+            Your focus has stayed low for a while. You can continue, or end this
+            session and return after a short break.
+          </div>
+        </div>
+        """,
         target,
     )
 
